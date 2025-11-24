@@ -135,43 +135,42 @@ class GitHubActionsAnalyzer:
 
     def parse_pytest_output(self, logs: str) -> List[Dict]:
         """Parse pytest output from CI logs"""
+        import re
         tests = []
 
         # Look for pytest output patterns
         lines = logs.split('\n')
 
-        # Debug: Print sample lines to understand format
-        print(f"\n  [DEBUG] Total log lines: {len(lines)}")
-        print("  [DEBUG] Sample lines containing 'PASSED', 'FAILED', or '::':")
-        sample_count = 0
-        for i, line in enumerate(lines):
-            if ('PASSED' in line or 'FAILED' in line or 'SKIPPED' in line or '::' in line) and sample_count < 30:
-                # Strip ANSI color codes for debugging
-                import re
-                clean_line = re.sub(r'\x1b\[[0-9;]*m', '', line)
-                print(f"    Line {i}: {clean_line[:200]}")
-                sample_count += 1
-
         for i, line in enumerate(lines):
             # Strip ANSI color codes that GitHub Actions might include
-            import re
             clean_line = re.sub(r'\x1b\[[0-9;]*m', '', line)
 
-            # Match pytest test results: "test_file.py::test_name PASSED"
+            # Match pytest test results with optional timestamp prefix
+            # Format: "[timestamp] test_file.py::test_name PASSED [percentage]"
             if '::' in clean_line and any(status in clean_line for status in ['PASSED', 'FAILED', 'SKIPPED', 'ERROR']):
                 parts = clean_line.split()
-                if len(parts) >= 2:
-                    test_id = parts[0]
-                    status = parts[1].lower()
 
-                    # Extract test name
-                    if '::' in test_id:
-                        test_name = test_id.split('::')[-1]
-                        tests.append({
-                            'test_name': test_name,
-                            'test_id': test_id,
-                            'status': status
-                        })
+                # Find the test_id (contains ::) and status
+                test_id = None
+                status = None
+
+                for j, part in enumerate(parts):
+                    if '::' in part:
+                        test_id = part
+                        # Status is typically the next non-bracket item
+                        if j + 1 < len(parts):
+                            potential_status = parts[j + 1].upper()
+                            if potential_status in ['PASSED', 'FAILED', 'SKIPPED', 'ERROR']:
+                                status = potential_status.lower()
+                        break
+
+                if test_id and status and '::' in test_id:
+                    test_name = test_id.split('::')[-1]
+                    tests.append({
+                        'test_name': test_name,
+                        'test_id': test_id,
+                        'status': status
+                    })
 
         return tests
 
