@@ -89,8 +89,8 @@ class FlakyDetector:
         self.verbose = verbose
         self.results: Dict[str, FlakyTest] = {}
         self.temp_dir = tempfile.mkdtemp()
-        # Store pytest's working directory for path resolution
-        self.pytest_cwd = self.test_path.parent if self.test_path.is_file() else self.test_path
+        # Store current working directory - pytest runs from here
+        self.pytest_cwd = Path.cwd()
 
     def run_detection(self) -> Dict[str, FlakyTest]:
         """Execute detection by running tests multiple times"""
