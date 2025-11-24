@@ -179,6 +179,155 @@ def detect(
 
 
 @app.command()
+def ci_github(
+    repo: str = typer.Argument(..., help="Repository in format 'owner/repo'"),
+    token: str = typer.Option(..., "--token", "-t", envvar="GITHUB_TOKEN", help="GitHub personal access token"),
+    days: int = typer.Option(30, "--days", "-d", help="Number of days to analyze"),
+    branch: str = typer.Option("main", "--branch", "-b", help="Branch to analyze"),
+    min_runs: int = typer.Option(3, "--min-runs", help="Minimum runs to consider"),
+):
+    """
+    Analyze GitHub Actions history to detect flaky tests.
+    """
+    from .ci_analyzer import GitHubActionsAnalyzer, get_flaky_tests
+
+    console.print(Panel.fit(
+        "[bold cyan]CI Flaky Test Analyzer - GitHub Actions[/bold cyan]\n"
+        f"Analyzing {repo} over last {days} days...",
+        border_style="cyan"
+    ))
+
+    analyzer = GitHubActionsAnalyzer(repo, token)
+    test_results = analyzer.analyze(days, branch)
+
+    flaky_tests = get_flaky_tests(test_results, min_runs)
+    stable_tests = [t for t in test_results.values() if not t.is_flaky and t.total_runs >= min_runs]
+
+    # Summary
+    console.print()
+    summary_table = Table(title="CI Analysis Summary", box=box.ROUNDED)
+    summary_table.add_column("Metric", style="cyan")
+    summary_table.add_column("Value", style="magenta")
+
+    summary_table.add_row("Repository", repo)
+    summary_table.add_row("Branch", branch)
+    summary_table.add_row("Time Period", f"{days} days")
+    summary_table.add_row("Total Tests", str(len(test_results)))
+    summary_table.add_row("Stable Tests", f"[green]{len(stable_tests)}[/green]")
+    summary_table.add_row("Flaky Tests", f"[red]{len(flaky_tests)}[/red]")
+
+    if test_results:
+        flaky_rate = (len(flaky_tests) / len(test_results)) * 100
+        summary_table.add_row("Flakiness Rate", f"{flaky_rate:.1f}%")
+
+    console.print(summary_table)
+
+    # Show flaky tests
+    if flaky_tests:
+        console.print(f"\n[bold red]⚠ {len(flaky_tests)} Flaky Test(s) Detected[/bold red]")
+
+        for i, test in enumerate(flaky_tests, 1):
+            console.print(f"\n[bold yellow]{i}. {test.test_name}[/bold yellow]")
+
+            results_table = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+            results_table.add_row("Total Runs:", str(test.total_runs))
+            results_table.add_row("Flakiness Score:", f"[red]{test.flakiness_score:.1%}[/red]")
+            results_table.add_row("Failure Rate:", f"{test.failure_rate:.1%}")
+            results_table.add_row("Results:", f"✓ {test.pass_count} / ✗ {test.fail_count} / ⊘ {test.skip_count}")
+            results_table.add_row("Branches:", ", ".join(sorted(test.branches)))
+
+            console.print(results_table)
+
+            # Show recent runs
+            recent = test.runs[:5]
+            if recent:
+                console.print("   Recent runs:")
+                for run in recent:
+                    status_icon = "✓" if run.status == "passed" else "✗"
+                    color = "green" if run.status == "passed" else "red"
+                    console.print(f"   [{color}]{status_icon}[/{color}] "
+                                  f"Run #{run.run_number} ({run.commit_sha[:7]}) - "
+                                  f"{run.timestamp.strftime('%Y-%m-%d %H:%M')}")
+    else:
+        console.print("\n[bold green]✓ No flaky tests detected in CI history![/bold green]")
+
+
+@app.command()
+def ci_gitlab(
+    project: str = typer.Argument(..., help="Project ID or 'namespace/project'"),
+    token: str = typer.Option(..., "--token", "-t", envvar="GITLAB_TOKEN", help="GitLab personal access token"),
+    days: int = typer.Option(30, "--days", "-d", help="Number of days to analyze"),
+    ref: str = typer.Option("main", "--ref", "-r", help="Branch/ref to analyze"),
+    gitlab_url: str = typer.Option("https://gitlab.com", "--url", help="GitLab instance URL"),
+    min_runs: int = typer.Option(3, "--min-runs", help="Minimum runs to consider"),
+):
+    """
+    Analyze GitLab CI history to detect flaky tests.
+    """
+    from .ci_analyzer import GitLabCIAnalyzer, get_flaky_tests
+
+    console.print(Panel.fit(
+        "[bold cyan]CI Flaky Test Analyzer - GitLab CI[/bold cyan]\n"
+        f"Analyzing {project} over last {days} days...",
+        border_style="cyan"
+    ))
+
+    analyzer = GitLabCIAnalyzer(project, token, gitlab_url)
+    test_results = analyzer.analyze(days, ref)
+
+    flaky_tests = get_flaky_tests(test_results, min_runs)
+    stable_tests = [t for t in test_results.values() if not t.is_flaky and t.total_runs >= min_runs]
+
+    # Summary
+    console.print()
+    summary_table = Table(title="CI Analysis Summary", box=box.ROUNDED)
+    summary_table.add_column("Metric", style="cyan")
+    summary_table.add_column("Value", style="magenta")
+
+    summary_table.add_row("Project", project)
+    summary_table.add_row("Ref", ref)
+    summary_table.add_row("Time Period", f"{days} days")
+    summary_table.add_row("Total Tests", str(len(test_results)))
+    summary_table.add_row("Stable Tests", f"[green]{len(stable_tests)}[/green]")
+    summary_table.add_row("Flaky Tests", f"[red]{len(flaky_tests)}[/red]")
+
+    if test_results:
+        flaky_rate = (len(flaky_tests) / len(test_results)) * 100
+        summary_table.add_row("Flakiness Rate", f"{flaky_rate:.1f}%")
+
+    console.print(summary_table)
+
+    # Show flaky tests
+    if flaky_tests:
+        console.print(f"\n[bold red]⚠ {len(flaky_tests)} Flaky Test(s) Detected[/bold red]")
+
+        for i, test in enumerate(flaky_tests, 1):
+            console.print(f"\n[bold yellow]{i}. {test.test_name}[/bold yellow]")
+
+            results_table = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+            results_table.add_row("Total Runs:", str(test.total_runs))
+            results_table.add_row("Flakiness Score:", f"[red]{test.flakiness_score:.1%}[/red]")
+            results_table.add_row("Failure Rate:", f"{test.failure_rate:.1%}")
+            results_table.add_row("Results:", f"✓ {test.pass_count} / ✗ {test.fail_count} / ⊘ {test.skip_count}")
+            results_table.add_row("Refs:", ", ".join(sorted(test.branches)))
+
+            console.print(results_table)
+
+            # Show recent runs
+            recent = test.runs[:5]
+            if recent:
+                console.print("   Recent runs:")
+                for run in recent:
+                    status_icon = "✓" if run.status == "passed" else "✗"
+                    color = "green" if run.status == "passed" else "red"
+                    console.print(f"   [{color}]{status_icon}[/{color}] "
+                                  f"Pipeline #{run.run_number} ({run.commit_sha[:7]}) - "
+                                  f"{run.timestamp.strftime('%Y-%m-%d %H:%M')}")
+    else:
+        console.print("\n[bold green]✓ No flaky tests detected in CI history![/bold green]")
+
+
+@app.command()
 def version():
     """Show version information"""
     from . import __version__

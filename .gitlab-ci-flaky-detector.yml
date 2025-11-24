@@ -1,0 +1,87 @@
+# GitLab CI configuration for Flaky Test Detection
+# To use: Include this file in your main .gitlab-ci.yml:
+#   include:
+#     - local: '.gitlab-ci-flaky-detector.yml'
+
+detect-flaky-tests:
+  stage: test
+  image: python:3.11
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'  # Run on schedule
+    - if: '$CI_PIPELINE_SOURCE == "web"'       # Allow manual triggers
+  script:
+    - pip install uv
+    - uv pip install --system flaky-test-detector
+    - |
+      flaky-detector ci-gitlab \
+        "$CI_PROJECT_ID" \
+        --token "$GITLAB_TOKEN" \
+        --days "${FLAKY_DAYS:-30}" \
+        --ref "${CI_DEFAULT_BRANCH:-main}" \
+        --url "$CI_SERVER_URL" \
+        --min-runs 3 | tee flaky-report.txt
+  artifacts:
+    name: "flaky-test-report-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - flaky-report.txt
+    expire_in: 30 days
+  variables:
+    FLAKY_DAYS: "30"  # Override in pipeline variables if needed
+
+# Optional: Create an issue when flaky tests are detected
+create-flaky-issue:
+  stage: test
+  image: python:3.11
+  needs: ["detect-flaky-tests"]
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: on_failure  # Only run if detection found flaky tests
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: on_failure
+  script:
+    - pip install python-gitlab
+    - |
+      python3 << 'SCRIPT'
+      import gitlab
+      import os
+      from datetime import datetime
+
+      gl = gitlab.Gitlab(os.environ['CI_SERVER_URL'], private_token=os.environ['GITLAB_TOKEN'])
+      project = gl.projects.get(os.environ['CI_PROJECT_ID'])
+
+      # Read the report
+      with open('flaky-report.txt', 'r') as f:
+          report = f.read()
+
+      # Check if issue already exists
+      issues = project.issues.list(labels=['flaky-tests'], state='opened')
+
+      title = '⚠️ Flaky Tests Detected in CI'
+      body = f"""## Flaky Tests Detected
+
+      Automated analysis found flaky tests in CI history.
+
+      ```
+      {report}
+      ```
+
+      _Analysis date: {datetime.now().isoformat()}_
+      _Pipeline: {os.environ['CI_PIPELINE_URL']}_
+      """
+
+      if issues:
+          # Add comment to existing issue
+          issue = issues[0]
+          issue.notes.create({'body': body})
+          print(f"Updated issue #{issue.iid}")
+      else:
+          # Create new issue
+          issue = project.issues.create({
+              'title': title,
+              'description': body,
+              'labels': ['flaky-tests', 'bug']
+          })
+          print(f"Created issue #{issue.iid}")
+      SCRIPT
+  variables:
+    GITLAB_TOKEN: "${GITLAB_TOKEN}"  # Must be set in CI/CD variables
