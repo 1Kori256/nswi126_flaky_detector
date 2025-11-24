@@ -49,10 +49,14 @@ class RootCauseAnalyzer:
     RANDOM_PATTERNS = [
         r'\brandom\.',
         r'\buuid\.uuid4\(\)',
+        r'\bgenerate_uuid\(',
+        r'\bgenerate_user_id\(',
         r'\bshuffle\(',
+        r'\bshuffle_list\(',
         r'\bchoice\(',
         r'\brandint\(',
         r'\brandrange\(',
+        r'\buuid4\(',
     ]
 
     CONCURRENCY_PATTERNS = [
