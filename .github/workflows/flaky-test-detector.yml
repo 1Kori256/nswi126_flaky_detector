@@ -10,6 +10,11 @@ on:
         description: 'Days of history to analyze'
         required: false
         default: '30'
+  push:  # Run on push for testing
+    branches: [main]
+    paths:
+      - '.github/workflows/flaky-test-detector.yml'
+      - 'flaky_test_detector/**'
 
 jobs:
   detect-flaky-tests:
@@ -30,9 +35,10 @@ jobs:
       - name: Install flaky-detector
         run: |
           pip install uv
-          uv pip install --system flaky-test-detector
+          uv pip install --system -e .
 
       - name: Analyze CI history for flaky tests
+        id: analyze
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -40,23 +46,31 @@ jobs:
             "${{ github.repository }}" \
             --days ${{ github.event.inputs.days || 30 }} \
             --branch main \
-            --min-runs 3 > flaky-report.txt
+            --min-runs 3 | tee flaky-report.txt
 
-          cat flaky-report.txt
+          # Check if flaky tests were found
+          if grep -q "Flaky Test(s) Detected" flaky-report.txt; then
+            echo "flaky_found=true" >> $GITHUB_OUTPUT
+          else
+            echo "flaky_found=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Upload report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: flaky-test-report
           path: flaky-report.txt
 
       - name: Comment on issue (if flaky tests found)
-        if: failure()
+        if: steps.analyze.outputs.flaky_found == 'true'
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const report = fs.readFileSync('flaky-report.txt', 'utf8');
+            const report = fs.existsSync('flaky-report.txt')
+              ? fs.readFileSync('flaky-report.txt', 'utf8')
+              : 'No report file found';
 
             // Create or update issue
             const issues = await github.rest.issues.listForRepo({
