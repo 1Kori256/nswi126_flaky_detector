@@ -10,11 +10,9 @@ on:
         description: 'Days of history to analyze'
         required: false
         default: '30'
-  push:  # Run on push for testing
-    branches: [main]
-    paths:
-      - '.github/workflows/flaky-test-detector.yml'
-      - 'flaky_test_detector/**'
+  workflow_run:  # Run after test workflow completes
+    workflows: ["Tests"]
+    types: [completed]
 
 jobs:
   detect-flaky-tests:
