@@ -139,10 +139,27 @@ class GitHubActionsAnalyzer:
 
         # Look for pytest output patterns
         lines = logs.split('\n')
+
+        # Debug: Print sample lines to understand format
+        print(f"\n  [DEBUG] Total log lines: {len(lines)}")
+        print("  [DEBUG] Sample lines containing 'PASSED', 'FAILED', or '::':")
+        sample_count = 0
         for i, line in enumerate(lines):
+            if ('PASSED' in line or 'FAILED' in line or 'SKIPPED' in line or '::' in line) and sample_count < 30:
+                # Strip ANSI color codes for debugging
+                import re
+                clean_line = re.sub(r'\x1b\[[0-9;]*m', '', line)
+                print(f"    Line {i}: {clean_line[:200]}")
+                sample_count += 1
+
+        for i, line in enumerate(lines):
+            # Strip ANSI color codes that GitHub Actions might include
+            import re
+            clean_line = re.sub(r'\x1b\[[0-9;]*m', '', line)
+
             # Match pytest test results: "test_file.py::test_name PASSED"
-            if '::' in line and any(status in line for status in ['PASSED', 'FAILED', 'SKIPPED', 'ERROR']):
-                parts = line.split()
+            if '::' in clean_line and any(status in clean_line for status in ['PASSED', 'FAILED', 'SKIPPED', 'ERROR']):
+                parts = clean_line.split()
                 if len(parts) >= 2:
                     test_id = parts[0]
                     status = parts[1].lower()
