@@ -10,6 +10,8 @@ from typing import List, Dict, Optional
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from collections import defaultdict
+import zipfile
+import io
 
 
 @dataclass
@@ -114,9 +116,21 @@ class GitHubActionsAnalyzer:
         try:
             response = requests.get(url, headers=self.headers)
             response.raise_for_status()
-            return response.text
+
+            # GitHub Actions logs are returned as a ZIP file
+            # Extract all log files and concatenate them
+            all_logs = []
+            with zipfile.ZipFile(io.BytesIO(response.content)) as zip_file:
+                for file_name in zip_file.namelist():
+                    with zip_file.open(file_name) as log_file:
+                        all_logs.append(log_file.read().decode('utf-8', errors='ignore'))
+
+            return '\n'.join(all_logs)
         except requests.RequestException as e:
             print(f"Error fetching logs for run {run_id}: {e}")
+            return None
+        except zipfile.BadZipFile as e:
+            print(f"Error extracting logs for run {run_id}: {e}")
             return None
 
     def parse_pytest_output(self, logs: str) -> List[Dict]:
