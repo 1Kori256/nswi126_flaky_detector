@@ -91,7 +91,18 @@ class GitHubActionsAnalyzer:
         try:
             response = requests.get(url, headers=self.headers, params=params)
             response.raise_for_status()
-            return response.json().get("workflow_runs", [])
+            all_runs = response.json().get("workflow_runs", [])
+
+            # Filter by workflow name if specified
+            if self.workflow_name:
+                # Match workflow name (case-insensitive, handles both "tests" and "tests.yml")
+                filtered_runs = [
+                    run for run in all_runs
+                    if self.workflow_name.lower() in run.get('name', '').lower()
+                ]
+                return filtered_runs
+
+            return all_runs
         except requests.RequestException as e:
             print(f"Error fetching workflow runs: {e}")
             return []
