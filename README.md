@@ -1,223 +1,84 @@
 # Flaky Test Detector
 
-An automated utility for detecting, analyzing, and suggesting repairs for flaky tests in Python projects using pytest.
+Repeat pytest runs and find tests with both passing and failing outcomes. Persistent
+failures, setup/teardown errors, skipped tests, and missing observations are reported
+separately. Static code hints can help investigate a failure; they do not establish
+its cause.
 
-## Overview
+## Run
 
-Flaky tests are tests that pass or fail "randomly" due to external hidden conditions and influences. One run of a flaky test may pass and the next run (with no change in the subject program or test case) may fail. This tool helps identify such tests and their root causes.
+Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/).
 
-## Features
-
-### 1. **Flaky Test Detection**
-- Runs test suites multiple times to detect inconsistent behavior
-- Calculates flakiness scores for each test
-- Identifies failure patterns (initially failing, rarely failing, intermittent, etc.)
-
-### 2. **Root Cause Analysis**
-Automatically analyzes test code to identify common flakiness patterns:
-- **Time-dependent**: Tests using `datetime.now()`, `time.time()`, etc.
-- **Random-dependent**: Tests using `random` module without fixed seed
-- **Order-dependent**: Tests relying on unordered collections (sets, dict keys)
-- **Concurrency issues**: Race conditions in threading/async code
-- **External dependencies**: Network calls, file I/O
-- **Floating-point comparison**: Exact float comparisons prone to rounding errors
-- **Global state pollution**: Tests modifying shared global state
-
-### 3. **Repair Suggestions**
-Provides actionable fix suggestions with code examples for each detected issue type.
-
-## Installation
-
-Using `uv` (recommended):
-
-```bash
-git clone <repository>
-cd flaky-test-detector
+```sh
+git clone https://github.com/1Kori256/nswi126_flaky_detector.git
+cd nswi126_flaky_detector
 uv sync
+uv run flaky-detector detect example_project/tests/test_demo.py --runs 4
 ```
 
-## Usage
+The controlled demo produces one flaky test (pass/fail/pass/fail), one persistent
+failure, and one passing test. It uses `FLAKY_DETECTOR_RUN`, which the detector sets
+for each child process. **Exit code 1 is expected for this demo.**
 
-### Basic Usage
+Alternatively, install into an existing virtual environment with
+`python -m pip install -e .`. The CLI also works as `python -m flaky_test_detector`.
 
-Run the detector on your test file or directory:
+## Your tests
 
-```bash
-uv run flaky-detector detect path/to/tests --runs 10
+Install this tool in the environment containing your project's test dependencies.
+Run it from your project's directory so its pytest configuration applies.
+
+```sh
+flaky-detector detect tests/ --runs 10 --timeout 300
+flaky-detector detect 'tests/test_api.py::TestAPI::test_create' --runs 5
+flaky-detector detect tests/ --runs 10 --json --output report.json
 ```
 
-### Command Options
+`--timeout` limits each pytest process, in seconds. `--json` writes a machine-readable
+report to stdout; `--output` saves the same report. `--verbose` adds progress on stderr
+and failure/repair examples. Use `--no-analyze` or `--no-suggest` to omit code hints
+or suggestions.
 
-- `--runs, -n`: Number of times to run each test (default: 10)
-- `--verbose, -v`: Show detailed output during execution
-- `--analyze / --no-analyze`: Enable/disable root cause analysis (default: enabled)
-- `--suggest / --no-suggest`: Enable/disable repair suggestions (default: enabled)
+| Exit | Meaning |
+| --- | --- |
+| 0 | Complete run with no observed failures or errors |
+| 1 | Mixed outcomes or persistent failures/errors observed |
+| 2 | Invalid input, execution/report error, or changing test collection |
 
-### Examples
+Each repetition uses a fresh Python process. Expected failures count as skipped;
+unexpected passes count as passed. The JSON `balance_score` is
+`2 × min(passes, failures + errors) / (passes + failures + errors)`. It describes
+the observed split, not the probability that a test is flaky.
 
-```bash
-# Run with 20 iterations for more confidence
-uv run flaky-detector detect tests/ --runs 20
+## CI history
 
-# Quick check with verbose output
-uv run flaky-detector detect tests/test_api.py --runs 5 --verbose
-
-# Detection only, without analysis
-uv run flaky-detector detect tests/ --no-analyze --no-suggest
-```
-## Architecture
-
-### Core Components
-
-1. **Detector (`detector.py`)**: Runs tests multiple times and tracks outcomes
-2. **Analyzer (`analyzer.py`)**: Uses AST parsing and pattern matching to identify root causes
-3. **Suggester (`suggester.py`)**: Maps root causes to actionable repair suggestions
-4. **CLI (`cli.py`)**: Rich command-line interface with colored output
-
-### How It Works
-
-1. **Detection Phase**:
-   - Executes pytest multiple times with JSON reporting
-   - Tracks pass/fail outcomes for each test
-   - Identifies tests with inconsistent results
-
-2. **Analysis Phase**:
-   - Parses test file using Python AST
-   - Searches for common flakiness patterns using regex
-   - Assigns confidence scores to identified causes
-
-3. **Suggestion Phase**:
-   - Maps each root cause type to relevant fixes
-   - Provides code examples and priorities
-   - Ranks suggestions by effectiveness
-
-## Example Project
-
-The repository includes an example project with intentionally flaky tests in `example_project/`:
-
-### Basic Example (14 tests)
-```bash
-# Simple example with 3 flaky tests
-uv run flaky-detector detect example_project/tests/test_flaky.py --runs 15
+```sh
+# Set GITHUB_TOKEN or GITLAB_TOKEN in your environment.
+flaky-detector ci-github owner/repo --days 30 --branch main
+flaky-detector ci-gitlab group/project --days 30 --ref main
 ```
 
-### Comprehensive Example (38 tests)
-```bash
-# Full test suite with diverse flakiness patterns
-uv run flaky-detector detect example_project/tests/test_comprehensive_flaky.py --runs 20
+These commands inspect verbose pytest logs from up to 20 recent completed runs.
+Candidates must share a full test ID and commit SHA. Duplicate log entries are
+collapsed; conflicting outcomes within one CI run are omitted because they may
+come from different matrix jobs. Candidates still need investigation: job and
+environment changes can explain differing outcomes at the same commit.
+
+The manual GitHub workflow and optional GitLab template save reports. They do not
+create issues or request reviews.
+
+## Limits and development
+
+Repetition cannot prove stability. The local detector preserves test order and does
+not simulate changing time, randomize test order, or follow fixtures and helper
+functions during static analysis. Hints inspect the selected test body and can miss
+indirect dependencies. Tests must emit a complete pytest-json-report; options such
+as `--maxfail` can leave missing observations.
+
+```sh
+uv run pytest
 ```
 
-The comprehensive example includes **38 tests** demonstrating:
-- ✅ **Time-dependent failures** (7 tests): datetime.now(), timing boundaries, expiration checks
-- ✅ **Random value dependencies** (5 tests): random.randint(), uuid4(), shuffle, choice
-- ✅ **Race conditions** (3 tests): threading without locks, async timing
-- ✅ **Unordered collections** (4 tests): sets, dict keys, iterations
-- ✅ **Floating-point comparisons** (4 tests): exact equality, accumulation errors
-- ✅ **Global state pollution** (6 tests): shared counters, DataStore, environment variables
-- ✅ **Stable tests** (8 tests): Properly written tests for comparison
-
-**Expected Results**: Detector should find ~8 flaky tests (21% flakiness rate) when run with 20 iterations.
-
-## Common Flakiness Patterns and Fixes
-
-### Time-Dependent Tests
-
-**Problem**: Tests that depend on current time fail at different times of day.
-
-**Fix**: Mock time with `freezegun`:
-```python
-from freezegun import freeze_time
-
-@freeze_time("2024-01-15 12:00:00")
-def test_greeting():
-    assert get_greeting() == "Good afternoon"
-```
-
-### Random Values
-
-**Problem**: Tests using random values without fixed seed.
-
-**Fix**: Set random seed:
-```python
-def test_random_behavior():
-    random.seed(42)
-    result = generate_user_id()
-    assert result == "user_5432"
-```
-
-### Unordered Collections
-
-**Problem**: Tests comparing sets/dict keys that have no guaranteed order.
-
-**Fix**: Sort before comparison:
-```python
-def test_process_data():
-    result = process_unordered_data([1, 2, 3])
-    assert sorted(result) == [2, 4, 6]
-```
-
-### Floating-Point Comparison
-
-**Problem**: Exact float comparisons fail due to rounding.
-
-**Fix**: Use pytest.approx:
-```python
-def test_average():
-    result = calculate_average([0.1, 0.1, 0.1])
-    assert result == pytest.approx(0.3)
-```
-
-### Race Conditions
-
-**Problem**: Concurrent code without proper synchronization.
-
-**Fix**: Use proper locking:
-```python
-import threading
-
-def test_concurrent():
-    lock = threading.Lock()
-    counter = {'value': 0}
-
-    def increment():
-        with lock:
-            counter['value'] += 1
-    # ...
-```
-
-### Global State
-
-**Problem**: Tests modifying shared state affecting other tests.
-
-**Fix**: Use pytest fixtures to reset state:
-```python
-@pytest.fixture(autouse=True)
-def reset_state():
-    yield
-    DataStore.clear()
-
-def test_something():
-    DataStore.save("key", "value")
-    # Automatically cleaned up
-```
-
-## Limitations
-
-- **Detection**: Requires multiple runs (recommended 10-20) for reliable detection
-- **Analysis**: Pattern-based, may miss complex or unusual flakiness causes
-- **Python-specific**: Only works with Python/pytest projects
-- **Static analysis**: Cannot detect runtime-only issues without code patterns
-
-## License
-
-MIT License - See LICENSE file for details
-
-## Credits
-
-Developed as part of NSWI126 Tools course project.
-
-Built with:
-- [pytest](https://pytest.org/) - Testing framework
-- [Rich](https://rich.readthedocs.io/) - Terminal formatting
-- [Typer](https://typer.tiangolo.com/) - CLI framework
-- [uv](https://github.com/astral-sh/uv) - Fast Python package manager
+The deterministic test suite is separate from `example_project/tests`, which contains
+intentional failures and older stochastic examples. Developed for the NSWI126 Tools
+course.

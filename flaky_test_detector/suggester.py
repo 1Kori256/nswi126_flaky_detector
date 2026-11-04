@@ -187,35 +187,18 @@ async def test_with_timeout():
         ]
 
     def _suggest_order_fixes(self) -> List[RepairSuggestion]:
-        """Suggestions for order-dependent tests"""
         return [
             RepairSuggestion(
-                title="Sort collections before comparison",
-                description="Convert to sorted lists for deterministic ordering",
-                code_example="""# Instead of:
-assert result == {1, 2, 3}
-
-# Do this:
-assert sorted(result) == [1, 2, 3]
-
-# Or for dicts:
-assert sorted(result.items()) == sorted(expected.items())""",
-                priority=1
+                title="Compare sets when order does not matter",
+                description="Set equality compares members without depending on iteration order.",
+                code_example="assert set(actual) == {1, 2, 3}",
+                priority=1,
             ),
             RepairSuggestion(
-                title="Use ordered collections",
-                description="Replace set/dict with list/OrderedDict when order matters",
-                code_example="""from collections import OrderedDict
-
-# Instead of:
-data = {'a': 1, 'b': 2}
-
-# Use:
-data = OrderedDict([('a', 1), ('b', 2)])
-
-# Or just use a list of tuples:
-data = [('a', 1), ('b', 2)]""",
-                priority=1
+                title="Sort before comparing sequences",
+                description="Canonicalize unordered input when a sequence comparison is required.",
+                code_example="assert sorted(actual) == sorted(expected)",
+                priority=2,
             ),
         ]
 

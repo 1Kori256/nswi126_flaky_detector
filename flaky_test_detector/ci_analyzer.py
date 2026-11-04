@@ -1,24 +1,23 @@
-"""
-CI/CD Pipeline Analyzer - Detects flaky tests from historical CI execution data
-Supports GitHub Actions and GitLab CI
-"""
+"""Read CI logs for same-commit outcome changes, which remain investigation candidates."""
+
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+import io
+import re
+from urllib.parse import quote
+import zipfile
 
 import requests
-import json
-from pathlib import Path
-from typing import List, Dict, Optional
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from collections import defaultdict
-import zipfile
-import io
+
+
+class CIAnalysisError(RuntimeError):
+    pass
 
 
 @dataclass
 class CITestRun:
-    """Single test execution in CI"""
     test_name: str
-    status: str  # passed, failed, skipped
+    status: str
     run_id: str
     run_number: int
     commit_sha: str
@@ -29,370 +28,161 @@ class CITestRun:
 
 @dataclass
 class CIFlakyTest:
-    """Test detected as flaky from CI history"""
     test_name: str
     total_runs: int
     pass_count: int = 0
     fail_count: int = 0
     skip_count: int = 0
-    runs: List[CITestRun] = field(default_factory=list)
+    runs: list = field(default_factory=list)
     branches: set = field(default_factory=set)
+    commit_sha: str = ''
 
     @property
-    def flakiness_score(self) -> float:
-        """Calculate flakiness score based on CI history"""
-        if self.total_runs == 0:
-            return 0.0
-        pass_ratio = self.pass_count / self.total_runs
-        fail_ratio = self.fail_count / self.total_runs
-        return min(pass_ratio, fail_ratio) * 2
+    def flakiness_score(self):
+        attempts = self.pass_count + self.fail_count
+        return 2 * min(self.pass_count, self.fail_count) / attempts if attempts else 0.0
 
     @property
-    def is_flaky(self) -> bool:
-        """Test is flaky if it has inconsistent results"""
+    def is_flaky(self):
         return self.pass_count > 0 and self.fail_count > 0
 
     @property
-    def failure_rate(self) -> float:
-        """Percentage of failures"""
-        if self.total_runs == 0:
-            return 0.0
-        return self.fail_count / self.total_runs
+    def failure_rate(self):
+        attempts = self.pass_count + self.fail_count
+        return self.fail_count / attempts if attempts else 0.0
 
 
-class GitHubActionsAnalyzer:
-    """Analyze test history from GitHub Actions"""
+_RESULT = re.compile(r'(?P<nodeid>\S+::.+?)\s+(?P<status>PASSED|FAILED|SKIPPED|ERROR|XFAIL|XPASS)'
+                     r'(?:\s+\[\s*\d+%\])?\s*$')
+_ANSI = re.compile(r'\x1b\[[0-9;]*m')
 
-    def __init__(self, repo: str, token: str, workflow_name: str = "tests"):
-        """
-        Args:
-            repo: Repository in format "owner/repo"
-            token: GitHub personal access token
-            workflow_name: Name of workflow file (without .yml)
-        """
+
+def parse_pytest_output(logs):
+    observations = {}
+    for line in logs.splitlines():
+        match = _RESULT.search(_ANSI.sub('', line))
+        if not match:
+            continue
+        nodeid = match['nodeid']
+        status = {'ERROR': 'failed', 'XFAIL': 'skipped', 'XPASS': 'passed'}.get(
+            match['status'], match['status'].lower())
+        observations.setdefault(nodeid, set()).add(status)
+    # Logs may repeat summaries or combine matrix jobs. Conflicting outcomes within
+    # one CI run cannot be assigned to a single execution context, so omit them.
+    return [{'test_name': nodeid, 'test_id': nodeid, 'status': next(iter(statuses))}
+            for nodeid, statuses in observations.items() if len(statuses) == 1]
+
+
+class _HistoryAnalyzer:
+    def _get(self, url, params=None):
+        try:
+            response = requests.get(url, headers=self.headers, params=params, timeout=30)
+            response.raise_for_status()
+            return response
+        except requests.RequestException as error:
+            raise CIAnalysisError(f'CI request failed: {error}') from error
+
+    def _pages(self, url, params, key=None, limit=None):
+        values = []
+        while url:
+            response = self._get(url, params)
+            try:
+                payload = response.json()
+                page = payload[key] if key else payload
+                if not isinstance(page, list):
+                    raise ValueError('Expected a list of CI records')
+            except (ValueError, KeyError, TypeError) as error:
+                raise CIAnalysisError(f'Invalid CI response: {error}') from error
+            values.extend(page)
+            if limit is not None and len(values) >= limit:
+                return values[:limit]
+            url = response.links.get('next', {}).get('url')
+            params = None
+        return values
+
+    parse_pytest_output = staticmethod(parse_pytest_output)
+
+    @staticmethod
+    def _record(results, tests, run_id, run_number, sha, branch, created):
+        timestamp = datetime.fromisoformat(created.replace('Z', '+00:00'))
+        for test in tests:
+            key = (test['test_id'], sha)
+            entry = results.setdefault(key, CIFlakyTest(test['test_id'], 0, commit_sha=sha))
+            entry.total_runs += 1
+            entry.branches.add(branch)
+            entry.runs.append(CITestRun(test['test_id'], test['status'], str(run_id),
+                                        run_number, sha, branch, timestamp))
+            attribute = {'passed': 'pass_count', 'failed': 'fail_count', 'skipped': 'skip_count'}[test['status']]
+            setattr(entry, attribute, getattr(entry, attribute) + 1)
+
+
+class GitHubActionsAnalyzer(_HistoryAnalyzer):
+    def __init__(self, repo, token, workflow_name=None):
+        if len(repo.split('/')) != 2 or not all(repo.split('/')):
+            raise ValueError('Repository must be owner/repo')
         self.repo = repo
-        self.token = token
         self.workflow_name = workflow_name
-        self.base_url = "https://api.github.com"
-        self.headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github.v3+json"
-        }
+        self.base_url = 'https://api.github.com'
+        self.headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json'}
 
-    def fetch_workflow_runs(self, days: int = 30, branch: str = "main") -> List[Dict]:
-        """Fetch workflow runs from last N days"""
-        since = (datetime.now() - timedelta(days=days)).isoformat()
+    def fetch_workflow_runs(self, days=30, branch='main'):
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        runs = self._pages(f'{self.base_url}/repos/{self.repo}/actions/runs',
+                           {'per_page': 100, 'branch': branch, 'created': f'>={since}',
+                            'status': 'completed'}, key='workflow_runs', limit=100)
+        if self.workflow_name:
+            runs = [run for run in runs if self.workflow_name.lower() in run.get('name', '').lower()]
+        return runs[:20]
 
-        url = f"{self.base_url}/repos/{self.repo}/actions/runs"
-        params = {
-            "per_page": 100,
-            "branch": branch,
-            "created": f">={since}"
-        }
-
+    def fetch_job_logs(self, run_id):
+        response = self._get(f'{self.base_url}/repos/{self.repo}/actions/runs/{run_id}/logs')
         try:
-            response = requests.get(url, headers=self.headers, params=params)
-            response.raise_for_status()
-            all_runs = response.json().get("workflow_runs", [])
+            with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+                return '\n'.join(archive.read(name).decode('utf-8', errors='replace')
+                                 for name in archive.namelist() if not name.endswith('/'))
+        except zipfile.BadZipFile as error:
+            raise CIAnalysisError(f'Invalid log archive for run {run_id}') from error
 
-            # Filter by workflow name if specified
-            if self.workflow_name:
-                # Match workflow name (case-insensitive, handles both "tests" and "tests.yml")
-                filtered_runs = [
-                    run for run in all_runs
-                    if self.workflow_name.lower() in run.get('name', '').lower()
-                ]
-                return filtered_runs
+    def analyze(self, days=30, branch='main'):
+        results = {}
+        for run in self.fetch_workflow_runs(days, branch):
+            tests = self.parse_pytest_output(self.fetch_job_logs(run['id']))
+            self._record(results, tests, run['id'], run['run_number'], run['head_sha'],
+                         run['head_branch'], run['created_at'])
+        return results
 
-            return all_runs
-        except requests.RequestException as e:
-            print(f"Error fetching workflow runs: {e}")
-            return []
 
-    def fetch_job_logs(self, run_id: int) -> Optional[str]:
-        """Fetch logs for a specific workflow run"""
-        url = f"{self.base_url}/repos/{self.repo}/actions/runs/{run_id}/logs"
+class GitLabCIAnalyzer(_HistoryAnalyzer):
+    def __init__(self, project_id, token, gitlab_url='https://gitlab.com'):
+        self.project_id = quote(str(project_id), safe='')
+        self.base_url = f'{gitlab_url.rstrip("/")}/api/v4'
+        self.headers = {'PRIVATE-TOKEN': token}
 
-        try:
-            response = requests.get(url, headers=self.headers)
-            response.raise_for_status()
+    def fetch_pipelines(self, days=30, ref='main'):
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        return self._pages(f'{self.base_url}/projects/{self.project_id}/pipelines',
+                           {'per_page': 100, 'ref': ref, 'updated_after': since}, limit=20)
 
-            # GitHub Actions logs are returned as a ZIP file
-            # Extract all log files and concatenate them
-            all_logs = []
-            with zipfile.ZipFile(io.BytesIO(response.content)) as zip_file:
-                for file_name in zip_file.namelist():
-                    with zip_file.open(file_name) as log_file:
-                        all_logs.append(log_file.read().decode('utf-8', errors='ignore'))
+    def fetch_pipeline_jobs(self, pipeline_id):
+        return self._pages(f'{self.base_url}/projects/{self.project_id}/pipelines/{pipeline_id}/jobs',
+                           {'per_page': 100})
 
-            return '\n'.join(all_logs)
-        except requests.RequestException as e:
-            print(f"Error fetching logs for run {run_id}: {e}")
-            return None
-        except zipfile.BadZipFile as e:
-            print(f"Error extracting logs for run {run_id}: {e}")
-            return None
+    def fetch_job_log(self, job_id):
+        return self._get(f'{self.base_url}/projects/{self.project_id}/jobs/{job_id}/trace').text
 
-    def parse_pytest_output(self, logs: str) -> List[Dict]:
-        """Parse pytest output from CI logs"""
-        import re
-        tests = []
-
-        # Look for pytest output patterns
-        lines = logs.split('\n')
-
-        for i, line in enumerate(lines):
-            # Strip ANSI color codes that GitHub Actions might include
-            clean_line = re.sub(r'\x1b\[[0-9;]*m', '', line)
-
-            # Match pytest test results with optional timestamp prefix
-            # Format: "[timestamp] test_file.py::test_name PASSED [percentage]"
-            if '::' in clean_line and any(status in clean_line for status in ['PASSED', 'FAILED', 'SKIPPED', 'ERROR']):
-                parts = clean_line.split()
-
-                # Find the test_id (contains ::) and status
-                test_id = None
-                status = None
-
-                for j, part in enumerate(parts):
-                    if '::' in part:
-                        test_id = part
-                        # Status is typically the next non-bracket item
-                        if j + 1 < len(parts):
-                            potential_status = parts[j + 1].upper()
-                            if potential_status in ['PASSED', 'FAILED', 'SKIPPED', 'ERROR']:
-                                status = potential_status.lower()
-                        break
-
-                if test_id and status and '::' in test_id:
-                    test_name = test_id.split('::')[-1]
-                    tests.append({
-                        'test_name': test_name,
-                        'test_id': test_id,
-                        'status': status
-                    })
-
-        return tests
-
-    def analyze(self, days: int = 30, branch: str = "main") -> Dict[str, CIFlakyTest]:
-        """Analyze CI history for flaky tests"""
-        print(f"Fetching GitHub Actions runs for {self.repo} (last {days} days)...")
-
-        workflow_runs = self.fetch_workflow_runs(days, branch)
-        test_results = defaultdict(lambda: CIFlakyTest(test_name="", total_runs=0))
-
-        print(f"Found {len(workflow_runs)} workflow runs")
-
-        for i, run in enumerate(workflow_runs[:20], 1):  # Limit to 20 runs for API quota
-            run_id = run['id']
-            run_number = run['run_number']
-            commit_sha = run['head_sha']
-            run_branch = run['head_branch']
-            timestamp = datetime.fromisoformat(run['created_at'].replace('Z', '+00:00'))
-
-            print(f"  Analyzing run {i}/20 (#{run_number})...", end=" ", flush=True)
-
-            logs = self.fetch_job_logs(run_id)
-            if not logs:
-                print("❌ No logs")
+    def analyze(self, days=30, ref='main'):
+        results = {}
+        for pipeline in self.fetch_pipelines(days, ref):
+            if pipeline.get('status') not in ('success', 'failed'):
                 continue
-
-            tests = self.parse_pytest_output(logs)
-            print(f"✓ {len(tests)} tests")
-
-            for test_data in tests:
-                test_name = test_data['test_name']
-                status = test_data['status']
-
-                if test_name not in test_results:
-                    test_results[test_name] = CIFlakyTest(
-                        test_name=test_name,
-                        total_runs=0
-                    )
-
-                test_result = test_results[test_name]
-                test_result.total_runs += 1
-                test_result.branches.add(run_branch)
-
-                ci_run = CITestRun(
-                    test_name=test_name,
-                    status=status,
-                    run_id=str(run_id),
-                    run_number=run_number,
-                    commit_sha=commit_sha,
-                    branch=run_branch,
-                    timestamp=timestamp
-                )
-                test_result.runs.append(ci_run)
-
-                if status == 'passed':
-                    test_result.pass_count += 1
-                elif status in ['failed', 'error']:
-                    test_result.fail_count += 1
-                elif status == 'skipped':
-                    test_result.skip_count += 1
-
-        return dict(test_results)
+            logs = [self.fetch_job_log(job['id']) for job in self.fetch_pipeline_jobs(pipeline['id'])
+                    if job.get('status') in ('success', 'failed')]
+            tests = self.parse_pytest_output('\n'.join(logs))
+            self._record(results, tests, pipeline['id'], pipeline['id'], pipeline['sha'],
+                         pipeline['ref'], pipeline['created_at'])
+        return results
 
 
-class GitLabCIAnalyzer:
-    """Analyze test history from GitLab CI"""
-
-    def __init__(self, project_id: str, token: str, gitlab_url: str = "https://gitlab.com"):
-        """
-        Args:
-            project_id: GitLab project ID or "namespace/project"
-            token: GitLab personal access token
-            gitlab_url: GitLab instance URL
-        """
-        self.project_id = project_id
-        self.token = token
-        self.base_url = f"{gitlab_url}/api/v4"
-        self.headers = {
-            "PRIVATE-TOKEN": token
-        }
-
-    def fetch_pipelines(self, days: int = 30, ref: str = "main") -> List[Dict]:
-        """Fetch pipelines from last N days"""
-        since = (datetime.now() - timedelta(days=days)).isoformat()
-
-        url = f"{self.base_url}/projects/{self.project_id}/pipelines"
-        params = {
-            "per_page": 100,
-            "ref": ref,
-            "updated_after": since
-        }
-
-        try:
-            response = requests.get(url, headers=self.headers, params=params)
-            response.raise_for_status()
-            return response.json()
-        except requests.RequestException as e:
-            print(f"Error fetching pipelines: {e}")
-            return []
-
-    def fetch_job_log(self, job_id: int) -> Optional[str]:
-        """Fetch logs for a specific job"""
-        url = f"{self.base_url}/projects/{self.project_id}/jobs/{job_id}/trace"
-
-        try:
-            response = requests.get(url, headers=self.headers)
-            response.raise_for_status()
-            return response.text
-        except requests.RequestException as e:
-            print(f"Error fetching job log {job_id}: {e}")
-            return None
-
-    def fetch_pipeline_jobs(self, pipeline_id: int) -> List[Dict]:
-        """Fetch all jobs for a pipeline"""
-        url = f"{self.base_url}/projects/{self.project_id}/pipelines/{pipeline_id}/jobs"
-
-        try:
-            response = requests.get(url, headers=self.headers)
-            response.raise_for_status()
-            return response.json()
-        except requests.RequestException as e:
-            print(f"Error fetching jobs for pipeline {pipeline_id}: {e}")
-            return []
-
-    def parse_pytest_output(self, logs: str) -> List[Dict]:
-        """Parse pytest output from CI logs"""
-        tests = []
-
-        lines = logs.split('\n')
-        for line in lines:
-            if '::' in line and any(status in line for status in ['PASSED', 'FAILED', 'SKIPPED', 'ERROR']):
-                parts = line.split()
-                if len(parts) >= 2:
-                    test_id = parts[0]
-                    status = parts[1].lower()
-
-                    if '::' in test_id:
-                        test_name = test_id.split('::')[-1]
-                        tests.append({
-                            'test_name': test_name,
-                            'test_id': test_id,
-                            'status': status
-                        })
-
-        return tests
-
-    def analyze(self, days: int = 30, ref: str = "main") -> Dict[str, CIFlakyTest]:
-        """Analyze CI history for flaky tests"""
-        print(f"Fetching GitLab CI pipelines (last {days} days)...")
-
-        pipelines = self.fetch_pipelines(days, ref)
-        test_results = defaultdict(lambda: CIFlakyTest(test_name="", total_runs=0))
-
-        print(f"Found {len(pipelines)} pipelines")
-
-        for i, pipeline in enumerate(pipelines[:20], 1):  # Limit to 20 for API quota
-            pipeline_id = pipeline['id']
-            commit_sha = pipeline['sha']
-            pipeline_ref = pipeline['ref']
-            timestamp = datetime.fromisoformat(pipeline['created_at'].replace('Z', '+00:00'))
-
-            print(f"  Analyzing pipeline {i}/20 (#{pipeline_id})...", end=" ", flush=True)
-
-            jobs = self.fetch_pipeline_jobs(pipeline_id)
-            test_job = next((j for j in jobs if 'test' in j['name'].lower()), None)
-
-            if not test_job:
-                print("❌ No test job")
-                continue
-
-            logs = self.fetch_job_log(test_job['id'])
-            if not logs:
-                print("❌ No logs")
-                continue
-
-            tests = self.parse_pytest_output(logs)
-            print(f"✓ {len(tests)} tests")
-
-            for test_data in tests:
-                test_name = test_data['test_name']
-                status = test_data['status']
-
-                if test_name not in test_results:
-                    test_results[test_name] = CIFlakyTest(
-                        test_name=test_name,
-                        total_runs=0
-                    )
-
-                test_result = test_results[test_name]
-                test_result.total_runs += 1
-                test_result.branches.add(pipeline_ref)
-
-                ci_run = CITestRun(
-                    test_name=test_name,
-                    status=status,
-                    run_id=str(pipeline_id),
-                    run_number=pipeline_id,
-                    commit_sha=commit_sha,
-                    branch=pipeline_ref,
-                    timestamp=timestamp
-                )
-                test_result.runs.append(ci_run)
-
-                if status == 'passed':
-                    test_result.pass_count += 1
-                elif status in ['failed', 'error']:
-                    test_result.fail_count += 1
-                elif status == 'skipped':
-                    test_result.skip_count += 1
-
-        return dict(test_results)
-
-
-def get_flaky_tests(test_results: Dict[str, CIFlakyTest], min_runs: int = 3) -> List[CIFlakyTest]:
-    """Filter and return flaky tests"""
-    flaky_tests = []
-
-    for test_name, test_data in test_results.items():
-        if test_data.total_runs >= min_runs and test_data.is_flaky:
-            flaky_tests.append(test_data)
-
-    # Sort by flakiness score
-    flaky_tests.sort(key=lambda t: t.flakiness_score, reverse=True)
-
-    return flaky_tests
+def get_flaky_tests(test_results, min_runs=3):
+    return sorted((test for test in test_results.values() if test.pass_count + test.fail_count >= min_runs and test.is_flaky),
+                  key=lambda test: (-test.flakiness_score, test.test_name, test.commit_sha))

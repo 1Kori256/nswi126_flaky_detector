@@ -1,6 +1,4 @@
-def main():
-    print("Hello from flaky-test-detector!")
+from flaky_test_detector.cli import app
 
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    app()
