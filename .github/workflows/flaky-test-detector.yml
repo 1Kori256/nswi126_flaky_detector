@@ -1,61 +1,42 @@
-name: Flaky Test Detection
+name: CI History Report
 
 on:
-  schedule:
-    # Run weekly on Monday at 9 AM UTC
-    - cron: '0 9 * * 1'
-  workflow_dispatch:  # Allow manual triggers
+  workflow_dispatch:
     inputs:
       days:
-        description: 'Days of history to analyze'
-        required: false
-        default: '30'
-  workflow_run:  # Run after test workflow completes
-    workflows: ["Tests"]
-    types: [completed]
+        description: Days of history to inspect
+        type: number
+        default: 30
+
+permissions:
+  actions: read
+  contents: read
 
 jobs:
-  detect-flaky-tests:
+  history:
     runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: read
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
-          python-version: '3.11'
-
-      - name: Install flaky-detector
-        run: |
-          pip install uv
-          uv pip install --system -e .
-
-      - name: Analyze CI history for flaky tests
-        id: analyze
+          python-version: '3.13'
+      - run: python -m pip install -e .
+      - name: Inspect recent history
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          DAYS: ${{ inputs.days }}
         run: |
-          flaky-detector ci-github \
-            "${{ github.repository }}" \
-            --days ${{ github.event.inputs.days || 30 }} \
-            --branch main \
-            --min-runs 3 | tee flaky-report.txt
-
-          # Check if flaky tests were found
-          if grep -q "Flaky Test(s) Detected" flaky-report.txt; then
-            echo "flaky_found=true" >> $GITHUB_OUTPUT
-          else
-            echo "flaky_found=false" >> $GITHUB_OUTPUT
+          set +e
+          flaky-detector ci-github "$REPOSITORY" --days "$DAYS" --branch main 2>&1 | tee flaky-report.txt
+          result=${PIPESTATUS[0]}
+          if [ "$result" -eq 1 ]; then
+            echo "Candidates found; inspect the report."
+            exit 0
           fi
-
-      - name: Upload report
+          exit "$result"
+      - uses: actions/upload-artifact@v7
         if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: flaky-test-report
+          name: ci-history-report
           path: flaky-report.txt

@@ -1,338 +1,162 @@
-"""
-CLI interface for flaky test detector
-"""
+"""Command-line reporting for repeated pytest runs and CI history."""
+
+import json
+from pathlib import Path
+from typing import Optional
 
 import typer
-from pathlib import Path
 from rich.console import Console
 from rich.table import Table
-from rich.panel import Panel
-from rich.markdown import Markdown
+from rich.text import Text
 from rich import box
 
-from .detector import FlakyDetector
+from .detector import DetectionError, FlakyDetector
 from .analyzer import RootCauseAnalyzer
 from .suggester import RepairSuggester
 
-
-app = typer.Typer(
-    name="flaky-detector",
-    help="Automated detection and analysis of flaky tests in Python projects"
-)
+app = typer.Typer(name='flaky-detector', help='Repeat pytest runs and inspect inconsistent outcomes.')
 console = Console()
 
 
 @app.command()
 def detect(
-    test_path: str = typer.Argument(..., help="Path to test file or directory"),
-    runs: int = typer.Option(10, "--runs", "-n", help="Number of times to run each test"),
-    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show detailed output"),
-    analyze: bool = typer.Option(True, "--analyze/--no-analyze", help="Analyze root causes"),
-    suggest: bool = typer.Option(True, "--suggest/--no-suggest", help="Suggest repairs"),
+    test_path: str = typer.Argument(..., help='Test file, directory, or pytest node ID'),
+    runs: int = typer.Option(10, '--runs', '-n', min=2, help='Number of repeated pytest runs'),
+    timeout: float = typer.Option(300, '--timeout', min=0.001, help='Timeout per pytest run, in seconds'),
+    verbose: bool = typer.Option(False, '--verbose', '-v', help='Progress and repair examples'),
+    analyze: bool = typer.Option(True, '--analyze/--no-analyze', help='Show static code hints'),
+    suggest: bool = typer.Option(True, '--suggest/--no-suggest', help='Suggest investigation or repair steps'),
+    json_output: bool = typer.Option(False, '--json', help='Write JSON to stdout'),
+    output: Optional[Path] = typer.Option(None, '--output', '-o', help='Save the JSON report'),
 ):
-    """
-    Detect flaky tests by running them multiple times and analyzing inconsistent results.
-    """
-    console.print(Panel.fit(
-        "[bold cyan]Flaky Test Detector[/bold cyan]\n"
-        f"Running tests {runs} times to detect flakiness...",
-        border_style="cyan"
-    ))
-
-    # Run detection
-    detector = FlakyDetector(test_path, runs=runs, verbose=verbose)
-
+    """Repeat tests; exit 1 for observed failures, or 2 for incomplete detection."""
     try:
+        detector = FlakyDetector(test_path, runs=runs, verbose=verbose, timeout=timeout)
         detector.run_detection()
-    except Exception as e:
-        console.print(f"[bold red]Error:[/bold red] {e}")
+    except (DetectionError, ValueError) as error:
+        if json_output:
+            typer.echo(json.dumps({'schema_version': 1, 'status': 'error', 'message': str(error)}))
+        else:
+            typer.echo(f'Detection failed: {error}', err=True)
+        raise typer.Exit(2)
+    report = detector.to_report()
+    if analyze:
+        for entry in report['tests']:
+            if entry['status'] != 'flaky':
+                continue
+            test = detector.results[entry['nodeid']]
+            hints = RootCauseAnalyzer(Path(test.test_file)).analyze(test.test_function)
+            entry['hints'] = [{'type': hint.type.value, 'description': hint.description,
+                               'lines': hint.line_numbers} for hint in hints]
+            if suggest:
+                entry['suggestions'] = [{'title': fix.title, 'description': fix.description,
+                                         'example': fix.code_example}
+                                        for fix in RepairSuggester().suggest_repairs(hints)]
+    encoded = json.dumps(report, indent=2, ensure_ascii=False)
+    if output is not None:
+        try:
+            output.write_text(encoded + '\n', encoding='utf-8')
+        except OSError as error:
+            typer.echo(f'Could not write report: {error}', err=True)
+            raise typer.Exit(2)
+    if json_output:
+        typer.echo(encoded)
+    else:
+        counts = report['summary']
+        console.print(f"{counts['total']} tests, {detector.completed_runs} runs: "
+                      f"{counts['flaky']} flaky, {counts['failing']} failing, "
+                      f"{counts['passed']} passed, {counts['skipped']} skipped, "
+                      f"{counts['incomplete']} incomplete.", markup=False)
+        problems = [entry for entry in report['tests'] if entry['status'] not in ('passed', 'skipped')]
+        if problems:
+            table = Table(box=box.SIMPLE, padding=(0, 1))
+            for heading in ('Test', 'Status', 'Pass', 'Fail', 'Error', 'Skip', 'Missing'):
+                table.add_column(heading, overflow='fold', no_wrap=heading != 'Test')
+            for entry in problems:
+                table.add_row(Text(entry['nodeid']), entry['status'],
+                              *[str(entry[key]) for key in ('passed', 'failed', 'errors', 'skipped', 'missing')])
+            console.print(table)
+            if verbose:
+                for entry in problems:
+                    if entry['failure_messages']:
+                        console.print(entry['failure_messages'][0], markup=False)
+        if counts['missing_observations']:
+            console.print(f"Collection changed: {counts['missing_observations']} missing observations.", markup=False)
+        if counts['flaky'] == 0:
+            console.print('No mixed pass/fail outcomes observed. Repetition cannot prove stability.', markup=False)
+        for entry in report['tests']:
+            hints = entry.get('hints', [])
+            if not hints:
+                continue
+            console.print(f"\nCode hints for {entry['nodeid']} (not confirmed causes):", markup=False)
+            for hint in hints:
+                console.print(f"  {hint['type']}: {hint['description']} Lines {hint['lines']}", markup=False)
+            for fix in entry.get('suggestions', []):
+                console.print(f"  Suggestion: {fix['title']}", markup=False)
+                if verbose:
+                    console.print(fix['example'], markup=False)
+    if any(test.missing_count for test in detector.results.values()):
+        raise typer.Exit(2)
+    if any(test.fail_count + test.error_count for test in detector.results.values()):
         raise typer.Exit(1)
 
-    # Get results
-    # Use the working directory pytest used (stored in detector)
-    pytest_cwd = detector.pytest_cwd
-    flaky_tests = detector.get_flaky_tests()
-    stable_tests = detector.get_stable_tests()
-    total_tests = len(flaky_tests) + len(stable_tests)
 
-    # Summary statistics
-    console.print()
-    summary_table = Table(title="Detection Summary", box=box.ROUNDED)
-    summary_table.add_column("Metric", style="cyan")
-    summary_table.add_column("Value", style="magenta")
-
-    summary_table.add_row("Total Tests", str(total_tests))
-    summary_table.add_row("Runs per Test", str(runs))
-    summary_table.add_row("Stable Tests", f"[green]{len(stable_tests)}[/green]")
-    summary_table.add_row("Flaky Tests", f"[red]{len(flaky_tests)}[/red]")
-
-    if total_tests > 0:
-        flaky_percentage = (len(flaky_tests) / total_tests) * 100
-        summary_table.add_row("Flakiness Rate", f"{flaky_percentage:.1f}%")
-
-    console.print(summary_table)
-
-    # Show flaky tests
-    if not flaky_tests:
-        console.print("\n[bold green]✓ No flaky tests detected! All tests are stable.[/bold green]")
-        return
-
-    console.print(f"\n[bold red]⚠ {len(flaky_tests)} Flaky Test(s) Detected[/bold red]")
-
-    for i, test in enumerate(flaky_tests, 1):
-        # Test details
-        console.print(f"\n[bold yellow]{i}. {test.test_function}[/bold yellow]")
-        console.print(f"   [dim]File:[/dim] {test.test_file}")
-
-        # Results table
-        results_table = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
-        results_table.add_row("Flakiness Score:", f"[red]{test.flakiness_score:.1%}[/red]")
-        results_table.add_row("Pattern:", f"[yellow]{test.failure_pattern}[/yellow]")
-        results_table.add_row(
-            "Results:",
-            f"✓ {test.pass_count} / ✗ {test.fail_count} / ⊘ {test.skip_count}"
-        )
-
-        # Show outcome pattern
-        outcome_symbols = []
-        for outcome in test.outcomes[:20]:
-            if outcome == 'passed':
-                outcome_symbols.append('[green]✓[/green]')
-            elif outcome == 'failed':
-                outcome_symbols.append('[red]✗[/red]')
-            else:
-                outcome_symbols.append('[yellow]⊘[/yellow]')
-
-        if len(test.outcomes) > 20:
-            outcome_symbols.append('...')
-
-        results_table.add_row("Sequence:", ' '.join(outcome_symbols))
-        console.print(results_table)
-
-        # Analyze root causes
-        if analyze:
-            # Resolve test file path relative to pytest's cwd
-            test_file_path = pytest_cwd / test.test_file
-
-            if test_file_path.exists():
-                analyzer = RootCauseAnalyzer(test_file_path)
-                causes = analyzer.analyze(test.test_function)
-
-                if causes:
-                    console.print("   [bold cyan]Root Causes:[/bold cyan]")
-                    for cause in causes:
-                        confidence_color = "green" if cause.confidence > 0.8 else "yellow" if cause.confidence > 0.5 else "red"
-                        console.print(f"   • [{confidence_color}]{cause.type.value}[/{confidence_color}] "
-                                      f"(confidence: {cause.confidence:.0%})")
-                        console.print(f"     {cause.description}")
-
-                        if cause.line_numbers:
-                            console.print(f"     [dim]Lines: {', '.join(map(str, cause.line_numbers))}[/dim]")
-
-                        # Show suggestions
-                        if suggest:
-                            suggester = RepairSuggester()
-                            suggestions = suggester.suggest_repairs([cause])
-
-                            if suggestions:
-                                console.print("     [bold green]Suggested Fixes:[/bold green]")
-                                for j, suggestion in enumerate(suggestions[:2], 1):  # Show top 2
-                                    console.print(f"     {j}. {suggestion.title}")
-                                    if verbose:
-                                        console.print(f"        {suggestion.description}")
-
-    # Detailed suggestions section
-    if suggest and flaky_tests:
-        console.print("\n" + "=" * 60)
-        console.print("[bold cyan]Detailed Repair Suggestions[/bold cyan]\n")
-
-        for i, test in enumerate(flaky_tests, 1):
-            # Resolve test file path relative to pytest's cwd
-            test_file_path = pytest_cwd / test.test_file
-            if not test_file_path.exists():
-                continue
-
-            analyzer = RootCauseAnalyzer(test_file_path)
-            causes = analyzer.analyze(test.test_function)
-
-            if not causes:
-                continue
-
-            console.print(f"[bold yellow]{test.test_function}[/bold yellow]")
-
-            suggester = RepairSuggester()
-            all_suggestions = suggester.suggest_repairs(causes)
-
-            for j, suggestion in enumerate(all_suggestions, 1):
-                priority_color = "red" if suggestion.priority == 1 else "yellow" if suggestion.priority == 2 else "blue"
-                console.print(f"\n[{priority_color}]Fix #{j} (Priority {suggestion.priority}):[/{priority_color}] "
-                              f"[bold]{suggestion.title}[/bold]")
-                console.print(f"{suggestion.description}\n")
-                console.print(Panel(
-                    suggestion.code_example,
-                    border_style="dim",
-                    padding=(0, 1)
-                ))
-
-            if i < len(flaky_tests):
-                console.print()
+def _show_history(analyzer, days, branch, min_runs):
+    from .ci_analyzer import CIAnalysisError, get_flaky_tests
+    try:
+        results = analyzer.analyze(days, branch)
+    except (CIAnalysisError, ValueError) as error:
+        typer.echo(f'CI analysis failed: {error}', err=True)
+        raise typer.Exit(2)
+    if not results:
+        console.print('No usable per-test observations found. Use verbose pytest logs (-v).', markup=False)
+        raise typer.Exit(2)
+    candidates = get_flaky_tests(results, min_runs)
+    console.print(f'{len(results)} test/commit groups; {len(candidates)} CI candidates.', markup=False)
+    console.print('History is limited to 20 recent runs. Job/environment changes may explain differences.', markup=False)
+    if candidates:
+        table = Table(box=box.SIMPLE)
+        for heading in ('Test', 'Commit', 'Pass', 'Fail', 'Skip'):
+            table.add_column(heading)
+        for test in candidates:
+            table.add_row(Text(test.test_name), test.commit_sha[:8], str(test.pass_count),
+                          str(test.fail_count), str(test.skip_count))
+        console.print(table)
+        raise typer.Exit(1)
+    console.print('No same-commit mixed outcomes observed; this is not proof of stability.', markup=False)
 
 
 @app.command()
 def ci_github(
-    repo: str = typer.Argument(..., help="Repository in format 'owner/repo'"),
-    token: str = typer.Option(..., "--token", "-t", envvar="GITHUB_TOKEN", help="GitHub personal access token"),
-    days: int = typer.Option(30, "--days", "-d", help="Number of days to analyze"),
-    branch: str = typer.Option("main", "--branch", "-b", help="Branch to analyze"),
-    min_runs: int = typer.Option(3, "--min-runs", help="Minimum runs to consider"),
+    repo: str = typer.Argument(..., help='owner/repo'),
+    token: str = typer.Option(..., '--token', '-t', envvar='GITHUB_TOKEN', help='Prefer GITHUB_TOKEN'),
+    days: int = typer.Option(30, '--days', '-d', min=1),
+    branch: str = typer.Option('main', '--branch', '-b'),
+    min_runs: int = typer.Option(3, '--min-runs', min=2),
 ):
-    """
-    Analyze GitHub Actions history to detect flaky tests.
-    """
-    from .ci_analyzer import GitHubActionsAnalyzer, get_flaky_tests
-
-    console.print(Panel.fit(
-        "[bold cyan]CI Flaky Test Analyzer - GitHub Actions[/bold cyan]\n"
-        f"Analyzing {repo} over last {days} days...",
-        border_style="cyan"
-    ))
-
-    analyzer = GitHubActionsAnalyzer(repo, token)
-    test_results = analyzer.analyze(days, branch)
-
-    flaky_tests = get_flaky_tests(test_results, min_runs)
-    stable_tests = [t for t in test_results.values() if not t.is_flaky and t.total_runs >= min_runs]
-
-    # Summary
-    console.print()
-    summary_table = Table(title="CI Analysis Summary", box=box.ROUNDED)
-    summary_table.add_column("Metric", style="cyan")
-    summary_table.add_column("Value", style="magenta")
-
-    summary_table.add_row("Repository", repo)
-    summary_table.add_row("Branch", branch)
-    summary_table.add_row("Time Period", f"{days} days")
-    summary_table.add_row("Total Tests", str(len(test_results)))
-    summary_table.add_row("Stable Tests", f"[green]{len(stable_tests)}[/green]")
-    summary_table.add_row("Flaky Tests", f"[red]{len(flaky_tests)}[/red]")
-
-    if test_results:
-        flaky_rate = (len(flaky_tests) / len(test_results)) * 100
-        summary_table.add_row("Flakiness Rate", f"{flaky_rate:.1f}%")
-
-    console.print(summary_table)
-
-    # Show flaky tests
-    if flaky_tests:
-        console.print(f"\n[bold red]⚠ {len(flaky_tests)} Flaky Test(s) Detected[/bold red]")
-
-        for i, test in enumerate(flaky_tests, 1):
-            console.print(f"\n[bold yellow]{i}. {test.test_name}[/bold yellow]")
-
-            results_table = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
-            results_table.add_row("Total Runs:", str(test.total_runs))
-            results_table.add_row("Flakiness Score:", f"[red]{test.flakiness_score:.1%}[/red]")
-            results_table.add_row("Failure Rate:", f"{test.failure_rate:.1%}")
-            results_table.add_row("Results:", f"✓ {test.pass_count} / ✗ {test.fail_count} / ⊘ {test.skip_count}")
-            results_table.add_row("Branches:", ", ".join(sorted(test.branches)))
-
-            console.print(results_table)
-
-            # Show recent runs
-            recent = test.runs[:5]
-            if recent:
-                console.print("   Recent runs:")
-                for run in recent:
-                    status_icon = "✓" if run.status == "passed" else "✗"
-                    color = "green" if run.status == "passed" else "red"
-                    console.print(f"   [{color}]{status_icon}[/{color}] "
-                                  f"Run #{run.run_number} ({run.commit_sha[:7]}) - "
-                                  f"{run.timestamp.strftime('%Y-%m-%d %H:%M')}")
-    else:
-        console.print("\n[bold green]✓ No flaky tests detected in CI history![/bold green]")
+    """Inspect same-commit changes in GitHub Actions pytest logs."""
+    from .ci_analyzer import GitHubActionsAnalyzer
+    try:
+        analyzer = GitHubActionsAnalyzer(repo, token)
+    except ValueError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(2)
+    _show_history(analyzer, days, branch, min_runs)
 
 
 @app.command()
 def ci_gitlab(
-    project: str = typer.Argument(..., help="Project ID or 'namespace/project'"),
-    token: str = typer.Option(..., "--token", "-t", envvar="GITLAB_TOKEN", help="GitLab personal access token"),
-    days: int = typer.Option(30, "--days", "-d", help="Number of days to analyze"),
-    ref: str = typer.Option("main", "--ref", "-r", help="Branch/ref to analyze"),
-    gitlab_url: str = typer.Option("https://gitlab.com", "--url", help="GitLab instance URL"),
-    min_runs: int = typer.Option(3, "--min-runs", help="Minimum runs to consider"),
+    project: str = typer.Argument(..., help='Project ID or namespace/project'),
+    token: str = typer.Option(..., '--token', '-t', envvar='GITLAB_TOKEN', help='Prefer GITLAB_TOKEN'),
+    days: int = typer.Option(30, '--days', '-d', min=1),
+    ref: str = typer.Option('main', '--ref', '-r'),
+    gitlab_url: str = typer.Option('https://gitlab.com', '--url'),
+    min_runs: int = typer.Option(3, '--min-runs', min=2),
 ):
-    """
-    Analyze GitLab CI history to detect flaky tests.
-    """
-    from .ci_analyzer import GitLabCIAnalyzer, get_flaky_tests
-
-    console.print(Panel.fit(
-        "[bold cyan]CI Flaky Test Analyzer - GitLab CI[/bold cyan]\n"
-        f"Analyzing {project} over last {days} days...",
-        border_style="cyan"
-    ))
-
-    analyzer = GitLabCIAnalyzer(project, token, gitlab_url)
-    test_results = analyzer.analyze(days, ref)
-
-    flaky_tests = get_flaky_tests(test_results, min_runs)
-    stable_tests = [t for t in test_results.values() if not t.is_flaky and t.total_runs >= min_runs]
-
-    # Summary
-    console.print()
-    summary_table = Table(title="CI Analysis Summary", box=box.ROUNDED)
-    summary_table.add_column("Metric", style="cyan")
-    summary_table.add_column("Value", style="magenta")
-
-    summary_table.add_row("Project", project)
-    summary_table.add_row("Ref", ref)
-    summary_table.add_row("Time Period", f"{days} days")
-    summary_table.add_row("Total Tests", str(len(test_results)))
-    summary_table.add_row("Stable Tests", f"[green]{len(stable_tests)}[/green]")
-    summary_table.add_row("Flaky Tests", f"[red]{len(flaky_tests)}[/red]")
-
-    if test_results:
-        flaky_rate = (len(flaky_tests) / len(test_results)) * 100
-        summary_table.add_row("Flakiness Rate", f"{flaky_rate:.1f}%")
-
-    console.print(summary_table)
-
-    # Show flaky tests
-    if flaky_tests:
-        console.print(f"\n[bold red]⚠ {len(flaky_tests)} Flaky Test(s) Detected[/bold red]")
-
-        for i, test in enumerate(flaky_tests, 1):
-            console.print(f"\n[bold yellow]{i}. {test.test_name}[/bold yellow]")
-
-            results_table = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
-            results_table.add_row("Total Runs:", str(test.total_runs))
-            results_table.add_row("Flakiness Score:", f"[red]{test.flakiness_score:.1%}[/red]")
-            results_table.add_row("Failure Rate:", f"{test.failure_rate:.1%}")
-            results_table.add_row("Results:", f"✓ {test.pass_count} / ✗ {test.fail_count} / ⊘ {test.skip_count}")
-            results_table.add_row("Refs:", ", ".join(sorted(test.branches)))
-
-            console.print(results_table)
-
-            # Show recent runs
-            recent = test.runs[:5]
-            if recent:
-                console.print("   Recent runs:")
-                for run in recent:
-                    status_icon = "✓" if run.status == "passed" else "✗"
-                    color = "green" if run.status == "passed" else "red"
-                    console.print(f"   [{color}]{status_icon}[/{color}] "
-                                  f"Pipeline #{run.run_number} ({run.commit_sha[:7]}) - "
-                                  f"{run.timestamp.strftime('%Y-%m-%d %H:%M')}")
-    else:
-        console.print("\n[bold green]✓ No flaky tests detected in CI history![/bold green]")
+    """Inspect same-commit changes in GitLab CI pytest logs."""
+    from .ci_analyzer import GitLabCIAnalyzer
+    _show_history(GitLabCIAnalyzer(project, token, gitlab_url), days, ref, min_runs)
 
 
-@app.command()
-def version():
-    """Show version information"""
-    from . import __version__
-    console.print(f"Flaky Test Detector v{__version__}")
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     app()
